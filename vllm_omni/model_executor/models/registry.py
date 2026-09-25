@@ -94,6 +94,11 @@ _OMNI_MODELS = {
         "funaudiochat",
         "FunAudioChatForConditionalGeneration",
     ),
+    "FunAudioChatCosyVoice3Code2Wav": (
+        "funaudiochat",
+        "funaudiochat_code2wav",
+        "FunAudioChatCosyVoice3Code2Wav",
+    ),
     "AuKForConditionalGeneration": (
         "auk",
         "auk",
