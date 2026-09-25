@@ -108,6 +108,32 @@ def test_async_chunk_reuses_lookahead_and_flushes_final_tail():
     assert payload.meta.finished.item() is True
 
 
+def test_async_chunk_emits_exact_chunk_size_with_reused_lookahead():
+    transfer_manager = _make_transfer_manager(chunk_frames=3, lookahead_frames=1)
+    request = _make_request()
+
+    first = funaudiochat2code2wav_async_chunk(
+        transfer_manager,
+        {"audio_token_ids": torch.tensor([[1, 2, 3, 4]])},
+        request,
+    )
+    second = funaudiochat2code2wav_async_chunk(
+        transfer_manager,
+        {"audio_token_ids": torch.tensor([[5, 6, 7]])},
+        request,
+    )
+
+    assert first is not None
+    assert first.codes.audio.tolist() == [1, 2, 3, 4]
+    assert first.meta.codec_chunk_frames == 4
+    assert first.meta.left_context_size == 0
+    assert second is not None
+    assert second.codes.audio.tolist() == [1, 2, 3, 4, 5, 6, 7]
+    assert second.meta.codec_chunk_frames == 4
+    assert second.meta.left_context_size == 3
+    assert second.meta.chunk_seq == 1
+
+
 def test_async_chunk_emits_terminal_marker_for_empty_audio():
     transfer_manager = _make_transfer_manager()
 

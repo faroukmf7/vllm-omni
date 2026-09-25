@@ -2,14 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU-only smoke tests for native FunAudioChat model integration."""
 
+from threading import Lock
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 from vllm.model_executor.models import ModelRegistry
 
 from vllm_omni.engine.arg_utils import register_omni_models_to_vllm
 from vllm_omni.model_executor.models import FunAudioChatForConditionalGeneration
+from vllm_omni.model_executor.models.funaudiochat.funaudiochat_code2wav import (
+    FunAudioChatCosyVoice3Code2Wav,
+)
+from vllm_omni.model_executor.stage_input_processors.funaudiochat import (
+    funaudiochat2code2wav_async_chunk,
+)
 from vllm_omni.transformers_utils.configs.funaudiochat import FunAudioChatConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -67,3 +75,44 @@ def test_funaudiochat_model_initializes_without_checkpoint_weights(mocker) -> No
     native_model.assert_called_once()
     assert model.load_weights(weights) == {"model.weight"}
     native_model.load_weights.assert_called_once_with(weights)
+
+
+def test_funaudiochat_stream_handoff_decodes_audio_output(mocker) -> None:
+    transfer_manager = SimpleNamespace(
+        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 2, "codec_vocab_size": 32}}),
+        request_payload={},
+    )
+    request = SimpleNamespace(external_req_id="request-1", is_finished=lambda: True)
+    stage_input = funaudiochat2code2wav_async_chunk(
+        transfer_manager,
+        {"audio_token_ids": torch.tensor([[11, 12]])},
+        request,
+        is_finished=True,
+    )
+    assert stage_input is not None
+
+    bridge = FunAudioChatCosyVoice3Code2Wav.__new__(FunAudioChatCosyVoice3Code2Wav)
+    nn.Module.__init__(bridge)
+    bridge.config = SimpleNamespace(sample_rate=24000, flow={"input_size": 80})
+    bridge.code2wav = mocker.Mock()
+    waveform = torch.tensor([[[0.1, 0.2, 0.3]]])
+    bridge.code2wav.forward_streaming.return_value = (waveform, None)
+    bridge._default_speaker_embedding = torch.ones((1, 192))
+    bridge._stream_cache_by_req = {}
+    bridge._stream_cache_lock = Lock()
+
+    output = bridge.forward(
+        stage_input.codes.audio,
+        model_intermediate_buffer=[stage_input],
+        seq_token_counts=[stage_input.codes.audio.numel()],
+    )
+
+    assert set(output.multimodal_outputs) == {"audio", "sr"}
+    assert len(output.multimodal_outputs["audio"]) == 1
+    torch.testing.assert_close(output.multimodal_outputs["audio"][0], waveform.reshape(-1))
+    assert output.multimodal_outputs["audio"][0].dtype == torch.float32
+    assert output.multimodal_outputs["sr"][0].item() == 24000
+    bridge.code2wav.forward_streaming.assert_called_once()
+    call = bridge.code2wav.forward_streaming.call_args.kwargs
+    assert call["token"].tolist() == [[11, 12]]
+    assert call["finalize"] is True

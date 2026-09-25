@@ -119,3 +119,66 @@ def test_missing_official_default_speaker_asset_has_actionable_error() -> None:
 
     with pytest.raises(FileNotFoundError, match="official CosyVoice3 default speaker embedding"):
         bridge._load_default_speaker_embedding()
+
+
+def test_forward_rejects_mismatched_codec_token_lengths() -> None:
+    bridge, _decoder = _bridge()
+
+    with pytest.raises(ValueError, match="but input_ids contain 2"):
+        bridge.forward(
+            torch.tensor([1, 2]),
+            model_intermediate_buffer=[_payload([1], req_id="req-a", left_context=0, finished=False)],
+            seq_token_counts=[2],
+        )
+
+
+def test_forward_rejects_missing_codec_codes() -> None:
+    bridge, _decoder = _bridge()
+
+    with pytest.raises(ValueError, match="missing codes.audio"):
+        bridge.forward(
+            torch.tensor([1, 2]),
+            model_intermediate_buffer=[{"meta": {"req_id": ["req-a"]}}],
+            seq_token_counts=[2],
+        )
+
+
+@pytest.mark.parametrize(
+    ("input_ids", "counts", "message"),
+    [
+        (torch.tensor([1, 2, 3]), [1, 1], "sum to 2"),
+        (torch.tensor([1, 2]), [-1, 3], "non-negative"),
+        (torch.tensor([1, 2]), [2], "Expected 2 codec-token lengths"),
+    ],
+)
+def test_forward_rejects_invalid_sequence_lengths(input_ids, counts, message) -> None:
+    bridge, _decoder = _bridge()
+
+    with pytest.raises(ValueError, match=message):
+        bridge.forward(
+            input_ids,
+            model_intermediate_buffer=[None, None],
+            seq_token_counts=counts,
+        )
+
+
+def test_forward_rejects_missing_cosvoice_feature_dimension() -> None:
+    bridge, _decoder = _bridge()
+    bridge.config = SimpleNamespace(sample_rate=24000, flow={})
+
+    with pytest.raises(ValueError, match="missing flow.input_size feature dimension"):
+        bridge.forward(torch.tensor([1]), seq_token_counts=[1])
+
+
+def test_forward_requires_decoder_waveform_tensor() -> None:
+    bridge, decoder = _bridge()
+    decoder.forward_streaming = lambda **kwargs: ("not-waveform", None)
+
+    with pytest.raises(TypeError, match="must return waveform tensor"):
+        bridge.forward(
+            torch.tensor([1]),
+            model_intermediate_buffer=[_payload([1], req_id="req-a", left_context=0, finished=False)],
+            seq_token_counts=[1],
+        )
+
+    assert "req-a" not in bridge._stream_cache_by_req

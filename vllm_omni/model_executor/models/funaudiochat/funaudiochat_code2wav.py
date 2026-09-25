@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -157,16 +157,37 @@ class FunAudioChatCosyVoice3Code2Wav(nn.Module):
             rows = [row.reshape(-1) for row in input_ids]
             if len(rows) == num_requests:
                 return rows
+            raise ValueError(f"FunAudioChat received {len(rows)} codec-token rows for {num_requests} requests")
         flat_ids = input_ids.reshape(-1)
         if seq_token_counts is None:
             if num_requests == 1:
                 return [flat_ids]
             raise ValueError("seq_token_counts is required to split FunAudioChat codec IDs across requests")
-        counts = [int(count) for count in seq_token_counts]
+        try:
+            counts = [int(count) for count in seq_token_counts]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("seq_token_counts must contain integer codec-token lengths") from exc
+        if len(counts) != num_requests:
+            raise ValueError(f"Expected {num_requests} codec-token lengths, got {len(counts)}")
+        if any(count < 0 for count in counts):
+            raise ValueError(f"Codec-token lengths must be non-negative, got {counts}")
+        if sum(counts) != flat_ids.numel():
+            raise ValueError(
+                f"seq_token_counts sum to {sum(counts)}, but input_ids contain {flat_ids.numel()} codec tokens"
+            )
         boundaries = [0]
         for count in counts:
             boundaries.append(boundaries[-1] + count)
-        return [flat_ids[boundaries[i] : min(boundaries[i + 1], flat_ids.numel())] for i in range(len(counts))]
+        return [flat_ids[boundaries[i] : boundaries[i + 1]] for i in range(len(counts))]
+
+    def _flow_input_size(self) -> int:
+        flow = getattr(self.config, "flow", None)
+        if not isinstance(flow, Mapping) or "input_size" not in flow:
+            raise ValueError("FunAudioChat CosyVoice3 config is missing flow.input_size feature dimension")
+        input_size = int(flow["input_size"])
+        if input_size <= 0:
+            raise ValueError(f"FunAudioChat flow.input_size must be positive, got {input_size}")
+        return input_size
 
     @staticmethod
     def _audio_codes(payload: Any) -> torch.Tensor | None:
@@ -210,11 +231,11 @@ class FunAudioChatCosyVoice3Code2Wav(nn.Module):
         if not isinstance(runtime_info, list):
             runtime_info = []
         seq_token_counts = kwargs.get("seq_token_counts")
-        segments = self._request_segments(input_ids, seq_token_counts, max(1, len(runtime_info)))
-        if len(segments) > len(runtime_info) and runtime_info:
+        num_requests = len(runtime_info) or (len(seq_token_counts) if seq_token_counts is not None else 1)
+        segments = self._request_segments(input_ids, seq_token_counts, num_requests)
+        if runtime_info and len(segments) != len(runtime_info):
             raise ValueError(
-                f"FunAudioChat received {len(segments)} codec sequences but only "
-                f"{len(runtime_info)} request payloads"
+                f"FunAudioChat received {len(segments)} codec sequences but only {len(runtime_info)} request payloads"
             )
         if self._default_speaker_embedding.numel() == 0:
             raise RuntimeError(
@@ -222,10 +243,14 @@ class FunAudioChatCosyVoice3Code2Wav(nn.Module):
                 "conditioning must be loaded before forward()."
             )
 
+        input_size = self._flow_input_size()
+        sample_rate_value = int(self.config.sample_rate)
+        if sample_rate_value <= 0:
+            raise ValueError(f"FunAudioChat CosyVoice3 sample_rate must be positive, got {sample_rate_value}")
         audio_chunks: list[torch.Tensor] = []
         sample_rates: list[torch.Tensor] = []
         empty_audio = _EMPTY_AUDIO.to(device=input_ids.device)
-        sample_rate = torch.tensor(int(self.config.sample_rate), dtype=torch.int32, device=input_ids.device)
+        sample_rate = torch.tensor(sample_rate_value, dtype=torch.int32, device=input_ids.device)
 
         for index, segment in enumerate(segments):
             raw = runtime_info[index] if index < len(runtime_info) else None
@@ -233,7 +258,19 @@ class FunAudioChatCosyVoice3Code2Wav(nn.Module):
             req_id, left_context, finished, chunked = self._request_metadata(raw)
             token = self._audio_codes(payload)
             if token is None:
+                if payload is not None:
+                    raise ValueError(f"FunAudioChat decoder payload for request index {index} is missing codes.audio")
                 token = segment.to(dtype=torch.long)
+            elif token.numel() != segment.numel():
+                raise ValueError(
+                    f"FunAudioChat decoder payload contains {token.numel()} codec tokens, "
+                    f"but input_ids contain {segment.numel()} for request index {index}"
+                )
+            if left_context < 0 or left_context > token.numel():
+                raise ValueError(
+                    f"FunAudioChat left_context_size must be between 0 and the codec-token length "
+                    f"({token.numel()}), got {left_context}"
+                )
             if not req_id:
                 if chunked:
                     raise ValueError("FunAudioChat streaming decoder payload is missing meta.req_id")
@@ -253,7 +290,7 @@ class FunAudioChatCosyVoice3Code2Wav(nn.Module):
             # sequences and conditions with its explicit default speaker vector.
             prompt_token = torch.empty((1, 0), dtype=torch.int32, device=token.device)
             prompt_feat = torch.empty(
-                (1, 0, int(self.config.flow["input_size"])),
+                (1, 0, input_size),
                 dtype=torch.float32,
                 device=token.device,
             )
@@ -272,6 +309,8 @@ class FunAudioChatCosyVoice3Code2Wav(nn.Module):
                 if finished:
                     with self._stream_cache_lock:
                         self._stream_cache_by_req.pop(req_id, None)
+            if not isinstance(speech, torch.Tensor):
+                raise TypeError(f"CosyVoice3 decoder must return waveform tensor, got {type(speech).__name__}")
             if not finished:
                 with self._stream_cache_lock:
                     self._stream_cache_by_req[req_id] = next_cache_state
